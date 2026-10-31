@@ -1,0 +1,13 @@
+# Colab já vem com torch + CUDA. O clef-flash foi testado pela Cloudflare com transformers 5.10.2;
+# o projeto roda com o mesmo transformers do PC.
+transformers==5.22.1
+peft==0.21.2
+laya==0.4.18
+mlflow==3.17.2
+python-dotenv
+pandas
+scikit-learn
+matplotlib
+pillow
+# Kernels rápidos da atenção linear do Qwen3.5 (sem eles o transformers cai num caminho em PyTorch puro, bem mais lento)
+flash-linear-attention==0.6.0

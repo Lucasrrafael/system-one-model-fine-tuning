@@ -5,10 +5,13 @@ Uso:  python run.py            (lê tudo do .env)
 from __future__ import annotations
 
 import shutil
+import sqlite3
 import sys
 import time
 import traceback
+from contextlib import closing
 from importlib.metadata import version
+from pathlib import Path
 
 from src.config import load_settings
 
@@ -22,7 +25,9 @@ import mlflow  # noqa: E402
 import pandas as pd  # noqa: E402
 import torch  # noqa: E402
 
-from src import hub, metrics, plots, predict, trainers  # noqa: E402
+from src import hub, metrics, plots  # noqa: E402
+from src.core.data import read_split  # noqa: E402
+from src.families import get_family  # noqa: E402
 
 # A validação por época do Laya roda em fp32; TF32 (Ampere+) deixou ela ~35% mais rápida na 3050.
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -76,6 +81,40 @@ def run_name():
     return S.mlflow_run_name or f"{model}-{S.train_mode}-{time.strftime('%Y%m%d-%H%M%S')}"
 
 
+def sqlite_path(uri):
+    return Path(uri[len("sqlite:///"):]) if uri.startswith("sqlite:///") else None
+
+
+def setup_mlflow():
+    db = sqlite_path(S.mlflow_tracking_uri)
+    if db:
+        db.parent.mkdir(parents=True, exist_ok=True)
+    mlflow.set_tracking_uri(S.mlflow_tracking_uri)
+    # Com SQLite (Colab) os artefatos vão para uma pasta conhecida, que o sync_mlflow.py remapeia no PC.
+    if S.mlflow_artifact_location and mlflow.get_experiment_by_name(S.mlflow_experiment) is None:
+        mlflow.create_experiment(S.mlflow_experiment,
+                                 artifact_location=f"{S.mlflow_artifact_location.rstrip('/')}/{S.mlflow_experiment}")
+    mlflow.set_experiment(S.mlflow_experiment)
+
+
+def mirror(run_dir):
+    """Copia o run e o MLflow (SQLite + artefatos) para MIRROR_DIR, ex.: o Google Drive no Colab."""
+    if not S.mirror_dir:
+        return
+    dst = Path(S.mirror_dir)
+    db = sqlite_path(S.mlflow_tracking_uri)
+    if db and db.exists():
+        (dst / "mlflow").mkdir(parents=True, exist_ok=True)
+        # backup() tira uma cópia consistente mesmo com o MLflow escrevendo no banco.
+        with closing(sqlite3.connect(db)) as src, closing(sqlite3.connect(dst / "mlflow" / db.name)) as out:
+            src.backup(out)
+        if S.mlflow_artifact_location and Path(S.mlflow_artifact_location).exists():
+            shutil.copytree(S.mlflow_artifact_location, dst / "mlflow" / "artifacts", dirs_exist_ok=True)
+    if run_dir.exists():
+        shutil.copytree(run_dir, dst / "runs" / run_dir.name, dirs_exist_ok=True)
+    print(f"  espelhado em {dst}", flush=True)
+
+
 def main():
     for split in ("train", "val", "test"):
         if not (S.data_dir / f"{split}.jsonl").exists():
@@ -84,10 +123,10 @@ def main():
     name = run_name()
     run_dir = S.runs_dir / name
     run_dir.mkdir(parents=True, exist_ok=True)
-    states, y_test, questions = predict.read_split(S.data_dir / "test.jsonl")
+    states, y_test, questions = read_split(S.data_dir / "test.jsonl")
+    family = get_family(S.model_family)
 
-    mlflow.set_tracking_uri(S.mlflow_tracking_uri)
-    mlflow.set_experiment(S.mlflow_experiment)
+    setup_mlflow()
     downloaded = None
     with mlflow.start_run(run_name=name):
         mlflow.log_params(S.public_params())
@@ -95,6 +134,7 @@ def main():
             "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
             "torch": torch.__version__,
             "laya": version("laya"),
+            "family": S.model_family,
             "model": S.hf_model_id + (f"/{S.hf_model_subfolder}" if S.hf_model_subfolder else ""),
         })
         stats_path = S.data_dir / "data_stats.json"
@@ -102,38 +142,37 @@ def main():
             mlflow.log_artifact(str(stats_path), "data")
         try:
             print(f"Baixando {S.hf_model_id} {S.hf_model_subfolder} para {S.models_dir} ...")
-            downloaded, base_dir = hub.download_model(S.hf_model_id, S.hf_model_subfolder, S.hf_model_revision,
-                                                      S.models_dir, S.hf_token)
+            downloaded, base_dir = family.download(S)
             mlflow.log_metric("model_download_mb", hub.folder_size_mb(downloaded))
 
             before = None
             if S.eval_baseline:
                 print("Avaliando o modelo base no teste ...")
-                probs_b, timing = predict.agent_probs(base_dir, states, questions, S.eval_batch_size)
+                probs_b, timing = family.predict_probs(S, base_dir, states, questions)
                 before = evaluate("baseline", y_test, probs_b, timing)
                 predictions_frame(states, y_test, probs_b).to_csv(run_dir / "predictions_baseline.csv", index=False)
                 mlflow.log_artifact(str(run_dir / "predictions_baseline.csv"), "predictions")
 
-            def on_epoch(epoch, loss, records):
+            def on_epoch(epoch, loss, probs_v, y_v):
                 mlflow.log_metric("train/loss", loss, step=epoch + 1)
-                if records:
-                    probs_v, y_v = predict.records_probs(records)
+                if probs_v is not None:
                     m = metrics.all_metrics(y_v, probs_v, S.score_labels, S.top_k, S.relevant_min_level, S.rank_by,
                                             S.ece_bins, S.rank_pool_size, S.rank_pools, S.split_seed)
                     mlflow.log_metrics({f"val/{k}": v for k, v in m.items()}, step=epoch + 1)
                     print(f"  val época {epoch + 1}: acc {m['accuracy']:.4f}  f1_macro {m['f1_macro']:.4f}  "
                           f"qwk {m['qwk']:.4f}  p@10 {m.get('precision_at_10', float('nan')):.3f}")
+                mirror(run_dir)
 
             print(f"Treinando (modo {S.train_mode}) ...")
             ckpt_dir = run_dir / "checkpoint"
-            report = trainers.train(S, base_dir, ckpt_dir, on_epoch)
+            report = family.train(S, base_dir, ckpt_dir, on_epoch)
             mlflow.log_params({k: report[k] for k in ("train_items", "calibration_items", "val_items",
                                                       "optimizer_updates", "params_total", "params_trainable")})
             mlflow.log_metrics({"train/seconds": report["train_seconds"], "train/peak_vram_gb": report["peak_vram_gb"]})
             mlflow.log_dict(report, "train_report.json")
 
             print("Avaliando o modelo ajustado no teste ...")
-            probs_a, timing = predict.agent_probs(ckpt_dir, states, questions, S.eval_batch_size)
+            probs_a, timing = family.predict_probs(S, ckpt_dir, states, questions, base_dir=base_dir)
             after = evaluate("finetuned", y_test, probs_a, timing)
             predictions_frame(states, y_test, probs_a).to_csv(run_dir / "predictions_finetuned.csv", index=False)
             mlflow.log_artifact(str(run_dir / "predictions_finetuned.csv"), "predictions")
@@ -157,6 +196,7 @@ def main():
             if downloaded is not None and S.delete_model_after_run:
                 hub.delete_model(downloaded)
                 print(f"Modelo baixado apagado: {downloaded}")
+    mirror(run_dir)
     print(f"\nPronto. Resultados em {S.mlflow_tracking_uri} (experimento {S.mlflow_experiment}, run {name}).")
 
 

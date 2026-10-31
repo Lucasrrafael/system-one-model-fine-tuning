@@ -5,6 +5,7 @@ Saída (em DATA_DIR): train.jsonl, val.jsonl, test.jsonl e data_stats.json
 """
 from __future__ import annotations
 
+import hashlib
 import json
 
 from src.config import load_settings  # primeiro: define HF_HOME antes do huggingface_hub
@@ -88,7 +89,8 @@ def main():
     for name, part in splits.items():
         write_jsonl(part, s.data_dir / f"{name}.jsonl", s)
         counts = part["level"].value_counts().sort_index()
-        stats[name] = {"rows": len(part), **{s.score_labels[i]: int(c) for i, c in counts.items()}}
+        sha256 = hashlib.sha256((s.data_dir / f"{name}.jsonl").read_bytes()).hexdigest()
+        stats[name] = {"rows": len(part), **{s.score_labels[i]: int(c) for i, c in counts.items()}, "sha256": sha256}
     (s.data_dir / "data_stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
     print(json.dumps(stats, indent=2))
 

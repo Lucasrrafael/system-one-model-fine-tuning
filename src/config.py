@@ -1,4 +1,11 @@
-"""Lê o .env da raiz do projeto. Cada campo aqui tem uma linha correspondente no .env."""
+"""Lê a configuração do projeto. Cada campo aqui tem uma linha correspondente no .env.example.
+
+Prioridade (a primeira que define a variável vence):
+  1. variável já definida no terminal
+  2. perfil em ENV_FILE (ex.: configs/clef-colab.env)
+  3. .env (local, fora do git)
+  4. .env.example (padrões commitados)
+"""
 from __future__ import annotations
 
 import os
@@ -10,8 +17,14 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent.parent
 SECRET_FIELDS = {"hf_token"}
 
-# Variáveis já definidas no terminal têm prioridade sobre o .env (útil para testes rápidos).
+_profile = os.getenv("ENV_FILE", "").strip()
+if _profile:
+    _profile_path = Path(_profile) if Path(_profile).is_absolute() else ROOT / _profile
+    if not _profile_path.exists():
+        raise FileNotFoundError(f"ENV_FILE não encontrado: {_profile_path}")
+    load_dotenv(_profile_path, override=False)
 load_dotenv(ROOT / ".env", override=False)
+load_dotenv(ROOT / ".env.example", override=False)
 # Precisam existir antes de importar huggingface_hub/transformers/mlflow, por isso ficam aqui.
 _work = os.getenv("WORK_DIR", "D:/laya-treino").strip()
 os.environ.setdefault("HF_HOME", str(Path(_work) / "hf-home"))
@@ -45,7 +58,10 @@ def _list(name: str, default: str = "", sep: str = ",") -> list[str]:
 class Settings:
     # pastas
     work_dir: Path
+    runs_dir: Path
+    mirror_dir: str
     # modelo
+    model_family: str
     hf_model_id: str
     hf_model_subfolder: str
     hf_model_revision: str
@@ -91,12 +107,20 @@ class Settings:
     calib_frac: float
     target_error: float
     log_every: int
+    # loop genérico (família clef)
+    dtype: str
+    warmup_fraction: float
+    brier_weight: float
+    calib_min_temperature: float
+    clef_max_length: int
+    resume_from: str
     # LoRA
     lora_r: int
     lora_alpha: int
     lora_dropout: float
     lora_lr: float
     lora_target_modules: list[str]
+    lora_target_regex: str
     # avaliação
     eval_baseline: bool
     eval_every_epoch: bool
@@ -110,6 +134,7 @@ class Settings:
     # mlflow
     mlflow_tracking_uri: str
     mlflow_experiment: str
+    mlflow_artifact_location: str
     mlflow_run_name: str
     keep_finetuned_checkpoint: bool
     log_checkpoint_to_mlflow: bool
@@ -127,10 +152,6 @@ class Settings:
         return self.work_dir / "models"
 
     @property
-    def runs_dir(self) -> Path:
-        return self.work_dir / "runs"
-
-    @property
     def hf_cache_dir(self) -> Path:
         return self.work_dir / "hf-cache"
 
@@ -141,8 +162,12 @@ class Settings:
 
 
 def load_settings() -> Settings:
+    work_dir = Path(_get("WORK_DIR", "D:/laya-treino"))
     s = Settings(
-        work_dir=Path(_get("WORK_DIR", "D:/laya-treino")),
+        work_dir=work_dir,
+        runs_dir=Path(_get("RUNS_DIR") or work_dir / "runs"),
+        mirror_dir=_get("MIRROR_DIR"),
+        model_family=_get("MODEL_FAMILY", "laya").lower(),
         hf_model_id=_get("HF_MODEL_ID", "convaiinnovations/laya"),
         hf_model_subfolder=_get("HF_MODEL_SUBFOLDER"),
         hf_model_revision=_get("HF_MODEL_REVISION"),
@@ -186,11 +211,18 @@ def load_settings() -> Settings:
         calib_frac=_float("CALIB_FRAC", 0.1),
         target_error=_float("TARGET_ERROR", 0.10),
         log_every=_int("LOG_EVERY", 100),
+        dtype=_get("DTYPE", "bf16").lower(),
+        warmup_fraction=_float("WARMUP_FRACTION", 0.05),
+        brier_weight=_float("BRIER_WEIGHT", 1.0),
+        calib_min_temperature=_float("CALIB_MIN_TEMPERATURE", 1.0),
+        clef_max_length=_int("CLEF_MAX_LENGTH", 2048),
+        resume_from=_get("RESUME_FROM"),
         lora_r=_int("LORA_R", 8),
         lora_alpha=_int("LORA_ALPHA", 16),
         lora_dropout=_float("LORA_DROPOUT", 0.1),
         lora_lr=_float("LORA_LR", 3e-4),
         lora_target_modules=_list("LORA_TARGET_MODULES", "Wqkv,Wo,Wi"),
+        lora_target_regex=_get("LORA_TARGET_REGEX"),
         eval_baseline=_bool("EVAL_BASELINE", True),
         eval_every_epoch=_bool("EVAL_EVERY_EPOCH", True),
         eval_batch_size=_int("EVAL_BATCH_SIZE", 32),
@@ -201,15 +233,22 @@ def load_settings() -> Settings:
         rank_pools=_int("RANK_POOLS", 500),
         ece_bins=_int("ECE_BINS", 15),
         mlflow_tracking_uri=_get("MLFLOW_TRACKING_URI", "http://localhost:5000"),
-        mlflow_experiment=_get("MLFLOW_EXPERIMENT", "laya-tickets-priority"),
+        mlflow_experiment=_get("MLFLOW_EXPERIMENT", "system-one-model-priority"),
+        mlflow_artifact_location=_get("MLFLOW_ARTIFACT_LOCATION"),
         mlflow_run_name=_get("MLFLOW_RUN_NAME"),
         keep_finetuned_checkpoint=_bool("KEEP_FINETUNED_CHECKPOINT", True),
         log_checkpoint_to_mlflow=_bool("LOG_CHECKPOINT_TO_MLFLOW", False),
     )
     if len(s.score_labels) != len(s.score_criteria):
         raise ValueError("SCORE_LABELS e SCORE_CRITERIA precisam ter o mesmo número de níveis")
+    if s.model_family not in ("laya", "clef"):
+        raise ValueError("MODEL_FAMILY deve ser laya ou clef")
     if s.train_mode not in ("lora", "head", "full"):
         raise ValueError("TRAIN_MODE deve ser lora, head ou full")
+    if s.model_family == "clef" and s.train_mode == "full":
+        raise ValueError("clef: TRAIN_MODE=full não é suportado (9B); use lora ou head")
+    if s.dtype not in ("bf16", "fp16", "fp32"):
+        raise ValueError("DTYPE deve ser bf16, fp16 ou fp32")
     if s.rank_by not in ("prob", "expected"):
         raise ValueError("RANK_BY deve ser prob ou expected")
     if s.hf_token:
