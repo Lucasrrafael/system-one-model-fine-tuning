@@ -1,0 +1,19 @@
+# MLflow local. O docker compose lê MLFLOW_VERSION, MLFLOW_PORT e MLFLOW_DATA_DIR do .env.
+# Banco (sqlite) e artefatos ficam em MLFLOW_DATA_DIR, no disco D:.
+services:
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v${MLFLOW_VERSION}
+    container_name: laya-mlflow
+    restart: unless-stopped
+    ports:
+      # Só acessível a partir desta máquina
+      - "127.0.0.1:${MLFLOW_PORT:-5000}:5000"
+    volumes:
+      - ${MLFLOW_DATA_DIR}:/mlflow
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --artifacts-destination /mlflow/artifacts
+      --serve-artifacts

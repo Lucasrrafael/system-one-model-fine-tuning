@@ -1,0 +1,9 @@
+# PyTorch com CUDA vem de outro índice e é instalado antes (ver README):
+#   pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
+laya
+mlflow-skinny==3.17.2
+python-dotenv
+pandas
+scikit-learn
+matplotlib
+peft
