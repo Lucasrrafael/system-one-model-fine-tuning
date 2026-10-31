@@ -1,8 +1,9 @@
-"""Os três modos de treino (lora, head, full) em cima do loop de treino do próprio Laya.
+"""Família laya: checkpoints no formato do Laya (rl_agent_config.json), treinados pelo loop do próprio laya.
 
-O fluxo segue `laya.train.finetune`: separa a fatia de calibração antes do treino, treina,
-ajusta uma temperatura por tipo de pergunta e salva no formato que `laya.load` lê.
-A diferença é o LoRA (que o laya-train não tem) e a validação a cada época para o MLflow.
+Os três modos de treino (lora, head, full) seguem `laya.train.finetune`: separa a fatia de
+calibração antes do treino, treina, ajusta uma temperatura por tipo de pergunta e salva no
+formato que `laya.load` lê. A diferença é o LoRA (que o laya-train não tem) e a validação a
+cada época para o MLflow.
 """
 from __future__ import annotations
 
@@ -11,6 +12,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+import numpy as np
 import torch
 from laya.calibrate import fit_abstention_thresholds, fit_temperature_map
 from laya.common import uses_parallel_layout
@@ -27,6 +29,43 @@ from laya.train import (
     split_calibration,
     train_model,
 )
+
+from src import hub
+
+
+def download(s):
+    return hub.download_model(s.hf_model_id, s.hf_model_subfolder, s.hf_model_revision, s.models_dir, s.hf_token)
+
+
+def predict_probs(s, model_dir, states, questions, base_dir=None):
+    """Carrega o checkpoint com `laya.load` (aplica a temperatura salva) e prevê em lote.
+
+    `base_dir` não é usado: um checkpoint do Laya ajustado já é completo.
+    """
+    import laya
+
+    agent = laya.load(str(model_dir), device="cuda" if torch.cuda.is_available() else "cpu")
+    qid = next(iter(questions))
+    k = len(questions[qid]["criteria"])
+    start = time.perf_counter()
+    results = agent.predict_batch(states, questions, batch_size=s.eval_batch_size, sort_by_length=True)
+    elapsed = time.perf_counter() - start
+    probs = np.array([[r["answers"][qid]["probabilities"][str(i)] for i in range(k)] for r in results])
+    probs = probs / probs.sum(1, keepdims=True)  # o Laya arredonda para 4 casas
+    del agent
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return probs, {"latency_ms_per_item": 1000 * elapsed / len(states), "eval_seconds": elapsed}
+
+
+def records_probs(records):
+    """Probabilidades a partir de `laya.train.calibration_records` (temperatura 1)."""
+    rows = []
+    for _qt, logits, _target, _k in records:
+        z = np.asarray(logits, dtype=float)
+        p = np.exp(z - z.max())
+        rows.append(p / p.sum())
+    return np.array(rows), np.array([int(np.argmax(t)) for _q, _l, t, _k in records])
 
 
 def make_config(s) -> TrainConfig:
@@ -84,7 +123,7 @@ def param_counts(model, mode):
 def train(s, base_dir: Path, out_dir: Path, on_epoch=None) -> dict:
     """Treina a partir de `base_dir` e salva o checkpoint calibrado em `out_dir`.
 
-    on_epoch(epoch, mean_loss, val_records) é chamado no fim de cada época.
+    on_epoch(epoch, mean_loss, val_probs, val_y) é chamado no fim de cada época.
     """
     config = make_config(s)
     config.validate()
@@ -112,12 +151,12 @@ def train(s, base_dir: Path, out_dir: Path, on_epoch=None) -> dict:
     model.to(dev)
 
     def epoch_end(epoch, mean_loss):
-        records = None
+        probs, y = None, None
         if val_items:
-            records = calibration_records(model, tok, val_items, dev, max_len, head_max_len,
-                                          batch_size=s.eval_batch_size, parallel=parallel)
+            probs, y = records_probs(calibration_records(model, tok, val_items, dev, max_len, head_max_len,
+                                                         batch_size=s.eval_batch_size, parallel=parallel))
         if on_epoch is not None:
-            on_epoch(epoch, mean_loss, records)
+            on_epoch(epoch, mean_loss, probs, y)
         # calibration_records deixa o modelo em eval(); o loop do Laya não volta para train().
         model.train()
         if config.freeze_encoder:

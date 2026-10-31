@@ -53,6 +53,15 @@ def download_model(repo_id: str, subfolder: str, revision: str, models_dir: Path
     return target, model_dir
 
 
+def download_snapshot(repo_id: str, revision: str, models_dir: Path, token: str = "",
+                      ignore: tuple[str, ...] = ()) -> tuple[Path, Path]:
+    """Repo inteiro, para famílias que não seguem o layout do Laya. Retorna (pasta baixada, pasta do modelo)."""
+    target = Path(models_dir) / repo_id.replace("/", "__")
+    snapshot_download(repo_id, revision=revision or None, local_dir=target,
+                      ignore_patterns=list(ignore) or None, token=token or None)
+    return target, target
+
+
 def folder_size_mb(path: Path) -> float:
     return sum(p.stat().st_size for p in Path(path).rglob("*") if p.is_file()) / 2**20
 

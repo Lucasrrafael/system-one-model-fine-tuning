@@ -1,17 +1,27 @@
 # laya-treino
 
-Fine-tuning do [Laya](https://huggingface.co/convaiinnovations/laya) numa pergunta `score` (escala ordinal):
+Fine-tuning de modelos de decisão "System One" numa pergunta `score` (escala ordinal):
 **"quão urgente é este ticket de suporte?"** (`low` → `medium` → `high`), com o dataset
 [Tobi-Bueck/customer-support-tickets](https://huggingface.co/datasets/Tobi-Bueck/customer-support-tickets) em inglês.
-Tudo é configurado no `.env`, e cada experimento vai para um MLflow local rodando em Docker.
+Dois modelos suportados: o [Laya](https://huggingface.co/convaiinnovations/laya) (roda na RTX 3050) e o
+[clef-flash](https://huggingface.co/Cloudflare/clef-flash) (9B, roda no Colab; ver "clef-flash no Colab").
+Cada experimento vai para um MLflow local rodando em Docker.
 
 ```
-.env                 todos os parâmetros (modelo, dados, treino, avaliação, MLflow)
-docker-compose.yml   servidor MLflow (dados em D:\laya-treino\mlflow)
-prepare_data.py      dataset -> train/val/test.jsonl no formato do Laya
-run.py               baixa o modelo, mede o antes, treina, mede o depois, loga no MLflow, apaga o modelo
-src/                 config, download do modelo, treino (lora/head/full), métricas, gráficos
+.env.example            padrões de todos os parâmetros (commitado); .env sobrescreve no seu PC
+configs/clef-colab.env  perfil do clef-flash no Colab (ENV_FILE=configs/clef-colab.env)
+docker-compose.yml      servidor MLflow (dados em D:\laya-treino\mlflow)
+prepare_data.py         dataset -> train/val/test.jsonl (+ hash de cada arquivo)
+run.py                  baixa o modelo, mede o antes, treina, mede o depois, loga no MLflow, apaga o modelo
+sync_mlflow.py          importa para o seu MLflow os runs feitos no Colab
+colab/clef_flash.ipynb  notebook do Colab: clona este repo e roda o run.py
+src/families/           o que muda por modelo: laya.py e clef.py (download, previsão, treino)
+src/core/               comum: dados, alvo por option_id, loop de treino, calibração
+src/                    config, download, métricas, gráficos
+tests/                  python -m pytest (inclui o caminho do clef num Qwen3.5 minúsculo)
 ```
+
+A configuração vem, em ordem de prioridade: variável do terminal → arquivo em `ENV_FILE` → `.env` → `.env.example`.
 
 O que é pesado fica em `D:\laya-treino` (`WORK_DIR`), fora do OneDrive:
 
@@ -44,10 +54,13 @@ O que é pesado fica em `D:\laya-treino` (`WORK_DIR`), fora do OneDrive:
    python run.py
    ```
 
-Para testar outro modelo, troque `HF_MODEL_ID` / `HF_MODEL_SUBFOLDER` no `.env` e rode `run.py` de novo.
+Para testar outro modelo, troque `MODEL_FAMILY`, `HF_MODEL_ID` e `HF_MODEL_SUBFOLDER` no `.env` e rode `run.py` de novo.
 O modelo é baixado para `D:\laya-treino\models`, usado e apagado no fim (`DELETE_MODEL_AFTER_RUN=true`).
-Só checkpoints no formato do Laya funcionam (precisam de `rl_agent_config.json`); hoje são
-`convaiinnovations/laya` (raiz e subpasta `multilingual`) e `convaiinnovations/laya-typed-decisions`.
+- `MODEL_FAMILY=laya`: checkpoints no formato do Laya (`rl_agent_config.json`): `convaiinnovations/laya`
+  (raiz e subpasta `multilingual`) e `convaiinnovations/laya-typed-decisions`.
+- `MODEL_FAMILY=clef`: `Cloudflare/clef-flash` (precisa de GPU grande, ver abaixo).
+
+Para rodar os testes: `python -m pytest`. Os do clef baixam só o código e o tokenizer do modelo (~20 MB).
 
 Para um teste rápido ponta a ponta, use `MAX_TRAIN_SAMPLES=500`, `MAX_EVAL_SAMPLES=200` e `EPOCHS=1`,
 rode `prepare_data.py` de novo e depois `run.py`.
@@ -61,6 +74,25 @@ rode `prepare_data.py` de novo e depois `run.py`.
 - Divisão 80/10/10 estratificada por prioridade (`SPLIT_SEED=42`), para os três conjuntos terem a mesma proporção de níveis.
 - É quase certamente um dataset sintético (o autor vende um gerador de tickets) e a licença é CC BY-NC 4.0.
   Bom para estudar, mas os rótulos não foram validados por humanos, então o teto de acurácia é desconhecido.
+
+## Resultados
+
+### Laya, treino completo (2.375 tickets de teste)
+
+Run `laya-lora-20261030-214114` no experimento `laya-tickets-priority`: `convaiinnovations/laya`, `TRAIN_MODE=lora`,
+4 épocas, configuração padrão do `.env.example`.
+
+| Métrica | Antes | Depois |
+|---|---|---|
+| Acurácia | 0,447 | **0,534** |
+| F1 macro | 0,296 | **0,495** |
+| Recall de `high` | 0,146 | **0,566** |
+| QWK | 0,128 | **0,385** |
+| ECE (calibração) | 0,268 | **0,028** |
+| Precision@10 nas caixas de 100 tickets | 0,688 | **0,815** |
+
+Levou 3,3 h na RTX 3050 6 GB, com pico de 2,8 GB de VRAM. Para comparar: chutar sempre `medium` acerta 41% no
+mesmo teste. Esse é o resultado que o clef-flash vai ter que bater no mesmo teste.
 
 ## Parâmetros
 
@@ -125,6 +157,59 @@ Para um resultado mais rápido: `MAX_TRAIN_SAMPLES=6000` (~2 h) ou o modo `full`
 
 **Limitação conhecida:** o loop do Laya não tem warmup. BERT e Mosbach et al. usam 10% de warmup linear;
 o cosseno do Laya começa direto na taxa cheia.
+
+## clef-flash no Colab
+
+O clef-flash é o Qwen3.5-9B (18,8 GB em bf16) com uma cabeça que pontua todas as opções de uma vez.
+Não cabe na 3050, então roda no Colab (G4, 96 GB). O código continua aqui: o notebook clona este repositório.
+
+### Passo a passo
+
+1. **No PC:** dê push da branch para o GitHub (o notebook clona a branch `clef-flash`).
+2. **No Drive:** crie `MyDrive/system-one/data/en/` e envie `train.jsonl`, `val.jsonl`, `test.jsonl` e `data_stats.json`
+   de `D:\laya-treino\data\en`. São os mesmos arquivos do teste do Laya; o notebook confere o SHA-256 de cada um.
+3. **No Colab:** abra
+   `https://colab.research.google.com/github/Lucasrrafael/system-one-model-fine-tuning/blob/clef-flash/colab/clef_flash.ipynb`,
+   escolha a GPU G4 e rode as células:
+   - **Sondagem:** 200 tickets, 1 época. Mede segundos por passo e VRAM; a célula seguinte converte isso em horas e
+     unidades de computação.
+   - **Run completo:** avaliação base, treino de 2 épocas, calibração e avaliação final.
+   - A cada época o run (checkpoint incluso) e o MLflow são copiados para `MyDrive/system-one/`. Se o Colab cair, a
+     seção "Se o Colab desconectar" continua do `checkpoint_latest`.
+4. **De volta no PC:** baixe `MyDrive/system-one/mlflow` e importe:
+   ```powershell
+   D:\laya-treino\.venv\Scripts\python.exe sync_mlflow.py --source D:\laya-treino\colab-mlflow
+   ```
+   Os runs aparecem no experimento `clef-tickets-priority`, com as mesmas métricas dos runs do Laya.
+
+### Como a família clef funciona (`src/families/clef.py`)
+
+- **Código do modelo:** usa o `joint_schema_model.py` do próprio repositório, na revisão fixada em
+  `HF_MODEL_REVISION` (o arquivo dessa revisão foi lido).
+- **Ordem das opções:** o encoder do clef põe `choice` em ordem alfabética e `noul` como `true, false`. O alvo de treino
+  é montado pelo `option_id` (`src/core/targets.py`), nunca pela posição.
+- **O que treina:** o backbone fica congelado; LoRA em todas as camadas lineares de texto (atenção cheia
+  `q/k/v/o_proj`, atenção linear `in_proj_qkv`, `in_proj_z`, `out_proj`, MLP) e a cabeça inteira (122M) em fp32.
+  A parte de visão fica de fora.
+- **O que salva:** só o adaptador LoRA e a cabeça (~0,5 GB), não os 19 GB do backbone. A avaliação final carrega o
+  modelo base e aplica os dois.
+- **Calibração:** uma temperatura por tipo de pergunta, com piso 1.
+
+### Hiperparâmetros do clef (`configs/clef-colab.env`)
+
+| Parâmetro | Valor | Por quê |
+|---|---|---|
+| LoRA | r=32, α=64, dropout 0 | Receita do Inner Jev (Geuter et al., 2026) para Gemma e Qwen. A Cloudflare usou r=256, mas num treino multitarefa com muito mais dados. |
+| Camadas do LoRA | todas as lineares de texto | QLoRA (Dettmers et al., 2023) e Inner Jev: LoRA só na atenção fica abaixo do fine-tuning completo. |
+| `LORA_LR` / `HEAD_LR` | 1e-4 / 1e-4 | Inner Jev usou 1e-4 no Qwen3.5-4B e 1e-4 na cabeça; o Our Own Jev (PayPal) também 1e-4. |
+| `WEIGHT_DECAY` | 0 | Inner Jev. |
+| Batch | 8 × 4 = 32 | Our Own Jev usou 32. Com ~18,6 mil itens dá ~580 passos por época. |
+| `EPOCHS` | 2 | Our Own Jev treinou 1 época num corpus maior; com uma tarefa só, 2 épocas dão mais passos sem repetir muito. |
+| `WARMUP_FRACTION` | 0.05 | O Inner Jev usa warmup (WSD) e o Mosbach et al. mostra que warmup estabiliza o fine-tuning. O loop do Laya não tem. |
+| `LOSS` | rlcd | O mesmo do run do Laya, para comparar; a Cloudflare também usa RLCD depois do CE + Brier. `soft-ce` e `soft-ce+brier` ficam disponíveis. |
+| `CALIB_MIN_TEMPERATURE` | 1 | Inner Jev restringe a temperatura do Qwen a ≥ 1. O Our Own Jev viu a temperatura < 1 piorar o ECE nos modelos grandes. |
+| `CLEF_MAX_LENGTH` | 2048 | O prompt fixo do clef + o ticket (p95 ~170 tokens) ficam bem abaixo; não corta nada. |
+| `DTYPE` | bf16 | A G4 tem bf16; o T4 não tem (lá use fp16, com risco de overflow). |
 
 ## Métricas
 
@@ -214,4 +299,7 @@ Foram pedidos k = 1, 3, 5, 10, 15, 20. Existem dois sentidos de top-k, e o proje
 - Spearman (1904). *The Proof and Measurement of Association between Two Things.* American Journal of Psychology.
 - Sun et al. (2019). *How to Fine-Tune BERT for Text Classification?* CCL.
 - Warner et al. (2024). *Smarter, Better, Faster, Longer: A Modern Bidirectional Encoder* (ModernBERT). arXiv:2412.13663.
+- Geuter, Cheng, Alvarez-Melis (2026). *Releasing the Inner Jev: A Simple Recipe for Open Decision Models.* arXiv:2610.17205.
+- Weng, Liu, Chen, Manoharan (2026). *Our Own Jev: Typed Decisions in One Forward Pass, from an In-House Judge to Open LoRA Models.* arXiv:2610.29052.
 - Laya: [model card](https://huggingface.co/convaiinnovations/laya), [guia de fine-tuning](https://nandhakishorm.github.io/laya/finetune/).
+- clef-flash: [model card](https://huggingface.co/Cloudflare/clef-flash), [post da Cloudflare](https://blog.cloudflare.com/clef-decision-models).
