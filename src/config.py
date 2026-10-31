@@ -233,7 +233,7 @@ def load_settings() -> Settings:
         rank_pools=_int("RANK_POOLS", 500),
         ece_bins=_int("ECE_BINS", 15),
         mlflow_tracking_uri=_get("MLFLOW_TRACKING_URI", "http://localhost:5000"),
-        mlflow_experiment=_get("MLFLOW_EXPERIMENT", "laya-tickets-priority"),
+        mlflow_experiment=_get("MLFLOW_EXPERIMENT", "system-one-model-priority"),
         mlflow_artifact_location=_get("MLFLOW_ARTIFACT_LOCATION"),
         mlflow_run_name=_get("MLFLOW_RUN_NAME"),
         keep_finetuned_checkpoint=_bool("KEEP_FINETUNED_CHECKPOINT", True),

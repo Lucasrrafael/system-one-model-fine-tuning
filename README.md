@@ -79,12 +79,12 @@ rode `prepare_data.py` de novo e depois `run.py`.
 
 ### Laya, treino completo (2.375 tickets de teste)
 
-Run `laya-lora-20261030-214114` no experimento `laya-tickets-priority`: `convaiinnovations/laya`, `TRAIN_MODE=lora`,
+Run `laya-lora-20261030-214114` no experimento `system-one-model-priority`: `convaiinnovations/laya`, `TRAIN_MODE=lora`,
 4 épocas, configuração padrão do `.env.example`.
 
 | Métrica | Antes | Depois |
 |---|---|---|
-| Acurácia | 0,447 | **0,534** |
+| Acurácia | 0,447 | **0,533** |
 | F1 macro | 0,296 | **0,495** |
 | Recall de `high` | 0,146 | **0,566** |
 | QWK | 0,128 | **0,385** |
@@ -92,7 +92,86 @@ Run `laya-lora-20261030-214114` no experimento `laya-tickets-priority`: `convaii
 | Precision@10 nas caixas de 100 tickets | 0,688 | **0,815** |
 
 Levou 3,3 h na RTX 3050 6 GB, com pico de 2,8 GB de VRAM. Para comparar: chutar sempre `medium` acerta 41% no
-mesmo teste. Esse é o resultado que o clef-flash vai ter que bater no mesmo teste.
+mesmo teste.
+
+### clef-flash, treino completo (mesmos 2.375 tickets)
+
+Run `clef-flash-lora-20261031-152945` no experimento `system-one-model-priority`: `Cloudflare/clef-flash` na revisão
+fixada, LoRA r=32 + cabeça, 2 épocas, `configs/clef-colab.env`, na G4 do Colab.
+
+| Métrica | Antes | Depois |
+|---|---|---|
+| Acurácia | 0,383 | **0,589** |
+| F1 macro | 0,357 | **0,550** |
+| Recall de `high` | 0,595 | **0,617** |
+| QWK | 0,134 | **0,451** |
+| ECE (calibração) | 0,377 | **0,026** |
+| Precision@10 nas caixas de 100 tickets | 0,608 | **0,863** |
+
+O run inteiro levou 59 min (56 min de treino, 1.164 passos de otimização), com pico de 23,2 GB de VRAM. Treinou
+202M dos 9,6B parâmetros (2,1%), e a temperatura calibrada ficou em 1,26. Sem treino, o clef fica abaixo do Laya
+(acurácia 0,383 contra 0,447) e é bem mais confiante do que deveria (ECE 0,377).
+
+### clef 27B, treino completo (mesmos 2.375 tickets)
+
+Run `clef-lora-20261031-170923` no experimento `system-one-model-priority`: `Cloudflare/clef` (Qwen3.8-27B por baixo),
+com o mesmo perfil e os mesmos hiperparâmetros do flash, na G4 do Colab. O código é o mesmo da família clef; só mudam
+duas variáveis, definidas numa célula do notebook antes da sondagem:
+
+```python
+import os
+os.environ["HF_MODEL_ID"] = "Cloudflare/clef"
+os.environ["HF_MODEL_REVISION"] = "cfddda043dd190ef3b01cff449d5ee8cff1e8ec6"
+```
+
+| Métrica | Antes | Depois |
+|---|---|---|
+| Acurácia | 0,396 | **0,585** |
+| F1 macro | 0,386 | **0,542** |
+| Recall de `high` | 0,472 | **0,614** |
+| QWK | 0,157 | **0,459** |
+| ECE (calibração) | 0,414 | **0,028** |
+| Precision@10 nas caixas de 100 tickets | 0,551 | **0,862** |
+
+O run inteiro levou 2 h 54 (2 h 48 de treino, os mesmos 1.164 passos de otimização), com pico de 60,9 GB de VRAM.
+Treinou 346M dos 27,7B parâmetros (1,2%), e a temperatura calibrada ficou em 1,07. A config do modelo tem um campo
+`output_gate_type: "swish"` que o transformers não usa; a versão com que a Cloudflare testou o modelo (5.10.2)
+também não, então o cálculo é o mesmo.
+
+### Comparação: Laya × clef-flash × clef 27B (os três ajustados, mesmo teste)
+
+| Métrica | Laya | clef-flash (9B) | clef (27B) |
+|---|---|---|---|
+| Acurácia | 0,533 | **0,589** | 0,585 |
+| Balanced accuracy | 0,489 | **0,540** | 0,534 |
+| F1 macro | 0,495 | **0,550** | 0,542 |
+| Recall de `high` | 0,566 | **0,617** | 0,614 |
+| Recall de `low` | 0,264 | **0,291** | 0,276 |
+| QWK | 0,385 | 0,451 | **0,459** |
+| Macro-MAE ↓ | 0,570 | 0,513 | **0,509** |
+| Spearman | 0,462 | 0,509 | **0,519** |
+| ECE ↓ | 0,028 | **0,026** | 0,028 |
+| NLL ↓ | 0,929 | **0,878** | 0,882 |
+| AP (`high` × resto) | 0,685 | **0,729** | 0,727 |
+| Precision@10 | 0,815 | **0,863** | 0,862 |
+| NDCG@10 | 0,893 | 0,919 | **0,921** |
+| Parâmetros do modelo | 0,42B | 9,6B | 27,7B |
+| Tempo / GPU | 3,3 h na RTX 3050 | 59 min na G4 | 2 h 54 na G4 |
+| Pico de VRAM | 2,8 GB | 23,2 GB | 60,9 GB |
+
+↓ = quanto menor, melhor.
+
+- **clef × Laya:** os dois clef ganham do Laya em quase tudo, mais nas métricas ordinais (QWK +0,066 e +0,074) e no
+  ranking (Precision@10 +0,048 e +0,047). Nas caixas de 100 tickets, o 1º colocado é `high` em 98,2% das vezes no
+  flash e em 97,8% no 27B, contra 96,8% no Laya. A calibração empata: os três terminam com ECE ~0,03.
+- **clef-flash × clef 27B:** empate. As diferenças vão de 0,000 a 0,015, ora a favor de um, ora do outro. Sem treino
+  o 27B começa um pouco melhor (F1 0,386 contra 0,357), mas o fine-tuning apaga a diferença.
+- **Custo:** o 27B levou ~3× o tempo e ~2,6× a VRAM do flash para chegar no mesmo lugar, então nesta tarefa o flash é
+  a escolha. Só o Laya cabe na 3050.
+- **Quanto confiar:** com 2.375 tickets, o erro-padrão da acurácia é ~0,01; o do recall de `low` é maior, porque só
+  conta os tickets `low`. A vantagem dos clef sobre o Laya (~0,05 de acurácia) não é ruído do teste; as diferenças
+  entre os dois clef e as de ECE são. Cada modelo rodou uma vez, com uma semente só, então a variação entre sementes
+  não foi medida.
 
 ## Parâmetros
 
@@ -176,11 +255,15 @@ Não cabe na 3050, então roda no Colab (G4, 96 GB). O código continua aqui: o 
    - **Run completo:** avaliação base, treino de 2 épocas, calibração e avaliação final.
    - A cada época o run (checkpoint incluso) e o MLflow são copiados para `MyDrive/system-one/`. Se o Colab cair, a
      seção "Se o Colab desconectar" continua do `checkpoint_latest`.
-4. **De volta no PC:** baixe `MyDrive/system-one/mlflow` e importe:
+4. **De volta no PC:** depois do `Pronto.` do run completo, baixe `MyDrive/system-one/mlflow` (o Drive gera um zip),
+   extraia em `D:\laya-treino\colab-mlflow` e importe. O `--source` é a pasta que tem o `mlflow.db`:
    ```powershell
-   D:\laya-treino\.venv\Scripts\python.exe sync_mlflow.py --source D:\laya-treino\colab-mlflow
+   D:\laya-treino\.venv\Scripts\python.exe sync_mlflow.py --source D:\laya-treino\colab-mlflow\mlflow --experiment system-one-model-priority
    ```
-   Os runs aparecem no experimento `clef-tickets-priority`, com as mesmas métricas dos runs do Laya.
+   Os runs completos de todos os modelos (Laya e clef) ficam juntos no experimento `system-one-model-priority`. Sem
+   `--experiment`, as sondagens (`clef-sondagem`) vêm junto, na aba delas. Um banco antigo, de quando o perfil usava
+   `clef-tickets-priority`, entra na mesma aba com `--experiment clef-tickets-priority --into system-one-model-priority`.
+   A pasta `runs` do Drive não precisa ser baixada: ela só tem o checkpoint, que não roda na 3050.
 
 ### Como a família clef funciona (`src/families/clef.py`)
 

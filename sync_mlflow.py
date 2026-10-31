@@ -6,6 +6,7 @@ Baixe do Drive a pasta  system-one/mlflow  (mlflow.db + artifacts/) e rode:
 
 Recria cada run no servidor de destino com params, tags, histórico completo das métricas e
 artefatos. Rodar de novo não duplica: cada run importado leva a tag sync.source_run_id.
+Com --into NOME, todos os runs vão para o experimento NOME em vez do de mesmo nome do Colab.
 """
 from __future__ import annotations
 
@@ -45,7 +46,7 @@ def _local_artifacts(artifact_uri: str, colab_root: str, local_root: Path) -> Pa
 
 
 def sync(source_db: Path, source_artifacts: Path, target_uri: str, colab_root: str = "/content/mlflow/artifacts",
-         experiments: list[str] | None = None) -> list[tuple[str, str]]:
+         experiments: list[str] | None = None, into: str | None = None) -> list[tuple[str, str]]:
     """Copia os runs. Devolve [(run_id de origem, run_id novo)] dos que foram importados agora."""
     src = MlflowClient(tracking_uri=f"sqlite:///{Path(source_db).resolve().as_posix()}")
     dst = MlflowClient(tracking_uri=target_uri)
@@ -53,15 +54,17 @@ def sync(source_db: Path, source_artifacts: Path, target_uri: str, colab_root: s
     for exp in src.search_experiments():
         if experiments and exp.name not in experiments:
             continue
-        dst_exp = dst.get_experiment_by_name(exp.name)
-        dst_exp_id = dst_exp.experiment_id if dst_exp else dst.create_experiment(exp.name)
+        name = into or exp.name
+        dst_exp = dst.get_experiment_by_name(name)
+        dst_exp_id = dst_exp.experiment_id if dst_exp else dst.create_experiment(name)
         done = {r.data.tags.get(SOURCE_TAG) for r in dst.search_runs([dst_exp_id], max_results=50000)}
         for run in src.search_runs([exp.experiment_id], max_results=50000):
-            if run.info.run_id in done:
+            origin = run.data.tags.get(SOURCE_TAG, run.info.run_id)  # cópia de cópia aponta para o run original
+            if origin in done:
                 print(f"  já importado: {run.info.run_name}")
                 continue
             tags = {k: v for k, v in run.data.tags.items() if k != "mlflow.runName"}
-            tags[SOURCE_TAG] = run.info.run_id
+            tags[SOURCE_TAG] = origin
             new = dst.create_run(dst_exp_id, start_time=run.info.start_time, run_name=run.info.run_name, tags=tags)
             new_id = new.info.run_id
             for part in _chunks([Param(k, v) for k, v in run.data.params.items()], BATCH["params"]):
@@ -74,7 +77,7 @@ def sync(source_db: Path, source_artifacts: Path, target_uri: str, colab_root: s
                 dst.log_artifacts(new_id, str(local))
             dst.set_terminated(new_id, status=run.info.status, end_time=run.info.end_time)
             imported.append((run.info.run_id, new_id))
-            print(f"  importado: {exp.name} / {run.info.run_name} ({len(history)} pontos de métrica)")
+            print(f"  importado: {name} / {run.info.run_name} ({len(history)} pontos de métrica)")
     return imported
 
 
@@ -87,10 +90,11 @@ def main():
     parser.add_argument("--colab-artifacts", default="/content/mlflow/artifacts",
                         help="MLFLOW_ARTIFACT_LOCATION usado no Colab")
     parser.add_argument("--experiment", action="append", help="só estes experimentos (pode repetir)")
+    parser.add_argument("--into", help="põe todos os runs neste experimento (padrão: o mesmo nome do Colab)")
     args = parser.parse_args()
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     imported = sync(args.source / "mlflow.db", args.source / "artifacts", args.target,
-                    args.colab_artifacts, args.experiment)
+                    args.colab_artifacts, args.experiment, args.into)
     print(f"\n{len(imported)} run(s) importado(s) para {args.target}")
 
 

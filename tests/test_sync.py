@@ -35,3 +35,32 @@ def test_sync_copies_run_once(tmp_path):
 
     assert sync_mlflow.sync(tmp_path / "colab" / "mlflow.db", colab_artifacts, target_uri,
                             colab_root=colab_artifacts.as_posix()) == []
+
+
+def test_sync_into_puts_every_experiment_in_one(tmp_path):
+    colab_artifacts = tmp_path / "colab" / "artifacts"
+    src = MlflowClient(tracking_uri=f"sqlite:///{(tmp_path / 'colab' / 'mlflow.db').as_posix()}")
+    for exp_name in ["laya-tickets-priority", "clef-tickets-priority"]:
+        exp_id = src.create_experiment(exp_name, artifact_location=(colab_artifacts / exp_name).as_posix())
+        src.set_terminated(src.create_run(exp_id, run_name=f"{exp_name}-run").info.run_id, "FINISHED")
+
+    clients = {}
+    for store in ["local", "third"]:
+        clients[store] = MlflowClient(tracking_uri=f"sqlite:///{(tmp_path / store / 'mlflow.db').as_posix()}")
+        clients[store].create_experiment("system-one-model-priority",
+                                         artifact_location=(tmp_path / store / "artifacts").as_posix())
+    target_uri, third_uri = (clients[store].tracking_uri for store in ["local", "third"])
+    args = (tmp_path / "colab" / "mlflow.db", colab_artifacts, target_uri, colab_artifacts.as_posix())
+    assert len(sync_mlflow.sync(*args, into="system-one-model-priority")) == 2
+    assert sync_mlflow.sync(*args, into="system-one-model-priority") == []
+
+    dst = clients["local"]
+    assert sorted(e.name for e in dst.search_experiments()) == ["Default", "system-one-model-priority"]
+    runs = dst.search_runs([dst.get_experiment_by_name("system-one-model-priority").experiment_id])
+    assert sorted(r.info.run_name for r in runs) == ["clef-tickets-priority-run", "laya-tickets-priority-run"]
+
+    # Copiar a cópia para um terceiro MLflow mantém a origem: o run do Colab não entra de novo lá.
+    local_artifacts = tmp_path / "local" / "artifacts"
+    assert len(sync_mlflow.sync(tmp_path / "local" / "mlflow.db", local_artifacts, third_uri,
+                                local_artifacts.as_posix())) == 2
+    assert sync_mlflow.sync(*args[:2], third_uri, args[3], into="system-one-model-priority") == []
